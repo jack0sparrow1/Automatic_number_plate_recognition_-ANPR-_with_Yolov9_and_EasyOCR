@@ -36,20 +36,10 @@ from utils.torch_utils import select_device
 
 # Common OCR character substitutions for Indian plates
 OCR_CORRECTIONS = {
-    # Digits misread as letters
-    '0': 'O',
-    '1': 'I',
-    '2': 'Z',
-    '5': 'S',
-    '8': 'B',
-    # Letters misread as digits
-    'O': '0',
-    'I': '1',
-    'Z': '2',
-    'S': '5',
-    'B': '8',
-    'G': '6',
-    'L': '1',
+    # Letters to Digits (for district and number positions)
+    'O': '0', 'I': '1', 'Z': '2', 'S': '5', 'B': '8', 'G': '6', 'L': '1', 'A': '4', 'T': '7', 'H': '4', 'K': '4',
+    # Digits to Letters (for state and series positions)
+    '0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B', '4': 'A', '6': 'G', '7': 'T',
 }
 
 def correct_ocr_errors(text):
@@ -117,38 +107,21 @@ class LicensePlateDetector:
 
 
     def preprocess_plate(self, plate):
-
         # Convert to grayscale
         gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
 
         # Upscale image (VERY IMPORTANT)
         scale = 3
-        gray = cv2.resize(
-            gray,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_CUBIC
-        )
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-        # Noise removal
-        gray = cv2.bilateralFilter(gray, 11, 17, 17)
+        # Subtle blur to join broken parts
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-        # Increase contrast
-        gray = cv2.equalizeHist(gray)
-
-        # Threshold
-        _, thresh = cv2.threshold(
-            gray,
-            0,
-            255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-
-        # Convert to RGB
-        processed = cv2.cvtColor(thresh, cv2.COLOR_GRAY2RGB)
-
-        return processed
+        # Contrast enhancement
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        gray = clahe.apply(gray)
+        
+        return gray
 
     def read_plate_section(self, plate_image, section_type='full', confidence_threshold=0.3):
         """
@@ -187,136 +160,134 @@ class LicensePlateDetector:
     
     def smart_ocr_plate(self, plate_image):
         """
-        Perform OCR on the entire plate and apply corrections based on position
+        Perform OCR using two passes:
+        1. A full-plate pass to get rough text and structure
+        2. Per-section passes with allowlists for better accuracy
         """
         processed_plate = self.preprocess_plate(plate_image)
-        
-        # Try to read with lower confidence threshold first
-        text, raw_results = self.read_plate_section(processed_plate, 'full', confidence_threshold=0.15)
-        
-        print(f"[DEBUG] Raw OCR text: '{text}'")
-        print(f"[DEBUG] Raw results count: {len(raw_results)}")
-        
-        if raw_results:
-            for i, (bbox, char_text, conf) in enumerate(raw_results):
-                print(f"  [{i}] '{char_text}' (confidence: {conf:.2f})")
-        
-        if not text:
-            print("[DEBUG] No text detected by OCR")
-            return None
-        
-        # Try to parse and correct based on expected positions
-        text_clean = text.replace(" ", "")
-        print(f"[DEBUG] Cleaned text: '{text_clean}' (length: {len(text_clean)})")
-        
-        if len(text_clean) < 6:
-            print(f"[DEBUG] Text too short (need at least 6 chars)")
-            return text_clean  # Return whatever we have
-        
-        # First 2 chars should be letters (state code)
-        state = ""
-        for c in text_clean[:2]:
-            if c.isalpha():
-                state += c
-        
-        if not state:
-            state = text_clean[:2]
-        
-        state = state.upper()[:2]
-        print(f"[DEBUG] State: '{state}'")
-        
-        # Next 2 chars should be digits (district code)
-        remaining = text_clean[2:]
-        district = ""
-        
-        for c in remaining[:4]:  # Look in next 4 chars for 2 digits
-            if c.isdigit():
-                district += c
-                if len(district) == 2:
-                    break
-            elif len(district) < 2:
-                # Try to convert letter to digit
-                converted = self._digit_from_letter(c)
-                if converted:
-                    district += converted
-                    if len(district) == 2:
-                        break
-        
-        print(f"[DEBUG] District: '{district}'")
-        
-        if len(district) < 2:
-            print(f"[DEBUG] Could not find 2 district digits")
-        
-        # Find position after district in remaining
-        chars_consumed = 0
-        for i, c in enumerate(remaining):
-            if c.isdigit() or (c.isalpha() and self._digit_from_letter(c)):
-                chars_consumed += 1
-                if chars_consumed == len(district):
-                    remaining = remaining[i+1:]
-                    break
-        
-        # Try to identify series and number from what's left
-        series = ""
-        number = ""
-        
-        # Get letters first (potential series, max 2)
-        for c in remaining:
-            if c.isalpha() and len(series) < 2:
-                series += c
-            elif c.isdigit() or (len(series) > 0 and self._digit_from_letter(c)):
+        h, w = processed_plate.shape[:2]
+
+        # --- Pass 1: Full plate to get rough structure ---
+        results = self.reader.readtext(
+            processed_plate,
+            paragraph=False,
+            decoder='beamsearch',
+            contrast_ths=0.1,
+            adjust_contrast=1.2,
+            text_threshold=0.3
+        )
+        raw_text = "".join([res[1] for res in results]).upper()
+        clean_text = "".join([c for c in raw_text if c.isalnum()])
+        print(f"[DEBUG] Raw OCR (Pass 1): '{clean_text}'")
+
+        # Strip known plate suffixes (IND, BH, etc.) that appear on HSRP/smart plates
+        KNOWN_SUFFIXES = ('IND', 'BH')
+        for suffix in KNOWN_SUFFIXES:
+            if clean_text.endswith(suffix):
+                clean_text = clean_text[:-len(suffix)]
+                print(f"[DEBUG] Stripped suffix '{suffix}': '{clean_text}'")
                 break
-        
-        # Rest should be numbers (4 digits)
-        remaining_for_number = remaining[len(series):]
-        for c in remaining_for_number:
-            if len(number) < 4:
-                if c.isdigit():
-                    number += c
-                else:
-                    converted = self._digit_from_letter(c)
-                    if converted:
-                        number += converted
-        
-        print(f"[DEBUG] Series: '{series}', Number: '{number}'")
-        
-        # Build result based on what we have
-        if len(state) == 2:
-            if len(district) == 2 and len(number) == 4:
-                if len(series) == 2:
-                    result = f"{state} {district} {series} {number}"
-                else:
-                    result = f"{state} {district} {number}"
-                print(f"[DEBUG] Successfully parsed: {result}")
-                return result
+
+        # --- Pass 2: Per-region reads ---
+        # Split the plate into:
+        #  Left half  = State + District (e.g. MH12)   → letters + digits
+        #  Right half = Series + Number  (e.g. DE1433)  → letters + digits
+        # Then further:
+        #  Right-right quarter = Number only (e.g. 1433) → digits only
+        left_half  = processed_plate[:, :w//2]
+        right_half = processed_plate[:, w//2:]
+        right_right = processed_plate[:, int(w * 0.6):]   # last ~40% for number
+
+        def read_region(region, allowlist, label):
+            res = self.reader.readtext(
+                region,
+                allowlist=allowlist,
+                decoder='beamsearch',
+                paragraph=False,
+                contrast_ths=0.1,
+                adjust_contrast=1.2,
+                text_threshold=0.2
+            )
+            text = "".join([r[1] for r in res]).upper()
+            text = "".join([c for c in text if c.isalnum()])
+            print(f"[DEBUG] {label}: '{text}'")
+            return text
+
+        left_text  = read_region(left_half,  'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 'Left (State+Dist)')
+        number_text = read_region(right_right, '0123456789', 'Number (digits only)')
+        # --- Use Pass 1 clean_text as primary, but substitute number from Pass 2 ---
+        # Determine number from targetted pass (digits only is more reliable)
+        if len(number_text) >= 4:
+            number_raw = number_text[-4:]
+        elif len(clean_text) >= 4:
+            number_raw = clean_text[-4:]
+        else:
+            number_raw = clean_text[-4:] if len(clean_text) >= 4 else clean_text
+
+        # Apply digit-only corrections to number
+        number = ""
+        for c in number_raw:
+            if c.isalpha():
+                if c in ('A', 'I', 'L', 'Z'): number += '1' if c in ('A', 'I', 'L') else '2'
+                else: number += self._digit_from_letter(c)
             else:
-                # Return what we have with spaces
-                print(f"[DEBUG] Partial match, returning: {state} {district} {series} {number}")
-                return f"{state} {district} {series} {number}".strip()
-        
-        # Fallback: return cleaned text
-        print(f"[DEBUG] Parsing failed, returning raw text")
-        return text_clean
+                number += c
+
+        # --- Build state, district, series from clean_text ---
+        # Anchor: use number to determine where number starts in clean_text
+        n = len(clean_text)
+
+        # State (pos 0-1): always letters
+        state_raw = clean_text[:2]
+        state = ""
+        for i, c in enumerate(state_raw):
+            if c.isdigit():
+                state += self._letter_from_digit(c)
+            elif c in ('K', 'I', '1') and i == 0:
+                state += 'M'
+            else:
+                state += c
+
+        # Middle = everything after state and before the 4-digit number
+        # We know the number from the digits pass, so middle = clean_text[2 : n-4]
+        middle = clean_text[2:-4] if n > 6 else clean_text[2:]
+
+        # District: first 2 chars of middle
+        district = ""
+        series   = ""
+
+        if len(middle) >= 2:
+            district_raw = middle[:2]
+            series_raw   = middle[2:]
+
+            # District digits — some states (e.g. DL) use alphanumeric like "3C"
+            for c in district_raw:
+                if c.isalpha():
+                    mapped = self._digit_from_letter(c)
+                    # If no mapping exists, keep the letter (valid alphanumeric district)
+                    district += mapped
+                else:
+                    district += c
+
+            # Series: should be letters
+            for c in series_raw:
+                if c.isdigit():
+                    series += self._letter_from_digit(c)
+                else:
+                    series += c
+        else:
+            district = middle
+
+        result = f"{state} {district} {series} {number}".strip()
+        result = " ".join(result.split())
+        print(f"[DEBUG] Final Parsed: {result}")
+        return result
+    
+    def _letter_from_digit(self, char):
+        return OCR_CORRECTIONS.get(char, char)
     
     def _digit_from_letter(self, char):
-        """Try to convert a misread letter to a digit"""
-        mapping = {
-            'O': '0',
-            'o': '0',
-            'I': '1',
-            'i': '1',
-            'Z': '2',
-            'z': '2',
-            'S': '5',
-            's': '5',
-            'B': '8',
-            'b': '8',
-            'G': '6',
-            'g': '6',
-            'L': '1',
-            'l': '1',
-        }
-        return mapping.get(char, "")
+        return OCR_CORRECTIONS.get(char, char)
 
 
     def detect(self, image_path):
