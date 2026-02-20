@@ -1,0 +1,12 @@
+ultralytics
+easyocr
+opencv-python
+Pillow
+numpy
+torch
+matplotlib
+pandas
+tqdm
+seaborn
+IPython
+setuptools
